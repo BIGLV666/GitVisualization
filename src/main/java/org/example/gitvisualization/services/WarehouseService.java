@@ -74,6 +74,9 @@ public class WarehouseService implements WarehouseAbstract {
             warehouseMapper.updateById(warehouse);
         } catch (DuplicateKeyException e) {
             throw new BusinessException(ResultCode.CONFLICT, "仓库名已存在");
+        }catch (Exception e){
+            log.error("修改失败",e);
+            throw e;
         }
         return warehouse;
     }
@@ -110,6 +113,9 @@ public class WarehouseService implements WarehouseAbstract {
         }
         if (!StringUtils.hasText(dto.getWarehousePath())) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "仓库路径不能为空");
+        }
+        if (dto.getRemoteToken() != null && dto.getRemoteToken().length() > 1000) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "访问令牌过长（最多 1000 字符）");
         }
     }
 }

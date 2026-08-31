@@ -62,6 +62,7 @@ function App() {
   const [showForm, setShowForm] = useState(false)
   const [editing, setEditing] = useState(false)
   const [editingId, setEditingId] = useState(null)
+  const [showToken, setShowToken] = useState(false)
   const [form, setForm] = useState({ name: '', warehousePath: '', remoteURL: '', remoteUsername: '', remoteToken: '' })
 
   // 分支操作弹窗（切换 / 合并 / 新建）
@@ -208,6 +209,14 @@ function App() {
     setEditingId(repo.warehouseId)
     setForm({ name: repo.name, warehousePath: repo.warehousePath, remoteURL: repo.remoteURL || '', remoteUsername: repo.remoteUsername || '', remoteToken: repo.remoteToken || '' })
     setShowForm(true)
+  }
+  function copyToken() {
+    if (!form.remoteToken) { notify('Token 为空'); return }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(form.remoteToken).then(() => notify('Token 已复制')).catch(() => notify('复制失败，请手动选择复制'))
+    } else {
+      notify('当前环境不支持一键复制，请点「显示」后手动复制')
+    }
   }
   async function submitForm(e) {
     e.preventDefault()
@@ -553,7 +562,13 @@ function App() {
         <label>本地路径<input value={form.warehousePath} onChange={e => setForm({ ...form, warehousePath: e.target.value })} placeholder="E:\\learncard\\your-repo" /></label>
         <label>远程仓库地址 <small>可选（推送时使用）</small><input value={form.remoteURL} onChange={e => setForm({ ...form, remoteURL: e.target.value })} placeholder="github.com/org/repository" /></label>
         <label>远程仓库用户名 <small>可选（推送时使用）</small><input value={form.remoteUsername} onChange={e => setForm({ ...form, remoteUsername: e.target.value })} placeholder="GitHub 用户名" /></label>
-        <label>访问令牌 Token <small>推私库必填</small><input type="password" value={form.remoteToken} onChange={e => setForm({ ...form, remoteToken: e.target.value })} placeholder="ghp_xxx（Personal Access Token）" /></label>
+        <label>访问令牌 Token <small>推私库必填</small>
+          <div className="token-input">
+            <input type={showToken ? 'text' : 'password'} autoComplete="new-password" value={form.remoteToken} onChange={e => setForm({ ...form, remoteToken: e.target.value })} placeholder="ghp_xxx（Personal Access Token）" />
+            <button type="button" className="token-toggle" onClick={e => { e.preventDefault(); setShowToken(s => !s) }}>{showToken ? '隐藏' : '显示'}</button>
+            <button type="button" className="token-toggle" onClick={e => { e.preventDefault(); copyToken() }}>复制</button>
+          </div>
+        </label>
         <div className="modal-actions"><button type="button" className="outline-btn" onClick={() => setShowForm(false)}>取消</button><button className="primary-btn">{editing ? '保存修改' : '登记仓库'}</button></div>
       </form>
     </div>}
