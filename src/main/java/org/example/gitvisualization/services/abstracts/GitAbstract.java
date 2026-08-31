@@ -31,6 +31,11 @@ public interface GitAbstract {
     GitStatusVo getStatus(Long id);
 
     /**
+     * 读取指定文件的差异（unified diff 文本，含已暂存/未暂存改动）。
+     */
+    String diff(Long id, String path);
+
+    /**
      * 暂存文件（git add）。paths 为空时暂存全部。
      */
     void stage(Long id, List<String> paths);

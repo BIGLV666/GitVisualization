@@ -12,12 +12,19 @@ import org.eclipse.jgit.api.Status;
 import org.eclipse.jgit.api.errors.*;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.ObjectReader;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.lib.StoredConfig;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
+import org.eclipse.jgit.diff.DiffFormatter;
+import org.eclipse.jgit.treewalk.AbstractTreeIterator;
+import org.eclipse.jgit.treewalk.CanonicalTreeParser;
+import org.eclipse.jgit.treewalk.EmptyTreeIterator;
+import org.eclipse.jgit.treewalk.FileTreeIterator;
+import org.eclipse.jgit.treewalk.filter.PathFilter;
 import org.example.gitvisualization.entity.Warehouse;
 import org.example.gitvisualization.enums.CodeEnum;
 import org.example.gitvisualization.mapper.WarehouseMapper;
@@ -28,8 +35,11 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -174,6 +184,45 @@ public class GitService implements GitAbstract {
             throw e;
         } catch (Exception e) {
             throw new BusinessException(CodeEnum.RUN_ERR, "读取工作区状态失败");
+        }
+    }
+
+    /**
+     * 读取指定文件的差异（unified diff 文本，HEAD vs 工作区，含已暂存与未暂存改动）。
+     */
+    @Override
+    public String diff(Long id, String path) {
+        if (!StringUtils.hasText(path)) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "请指定文件路径");
+        }
+        try (Repository repo = openRepository(id)) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            try (DiffFormatter fmt = new DiffFormatter(out)) {
+                fmt.setRepository(repo);
+                fmt.setPathFilter(PathFilter.create(path));
+                try (ObjectReader reader = repo.newObjectReader()) {
+                    AbstractTreeIterator oldTree = new EmptyTreeIterator();
+                    ObjectId head = repo.resolve(Constants.HEAD);
+                    if (head != null) {
+                        try (RevWalk walk = new RevWalk(repo)) {
+                            RevCommit commit = walk.parseCommit(head);
+                            CanonicalTreeParser parser = new CanonicalTreeParser();
+                            parser.reset(reader, commit.getTree().getId());
+                            oldTree = parser;
+                        }
+                    }
+                    AbstractTreeIterator newTree = new FileTreeIterator(repo);
+                    fmt.format(oldTree, newTree);
+                }
+                fmt.flush();
+            }
+            String text = out.toString(StandardCharsets.UTF_8);
+            return StringUtils.hasText(text) ? text : "（该文件没有可显示的差异）";
+        } catch (BusinessException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("读取文件差异失败, id={}, path={}", id, path, e);
+            throw new BusinessException(CodeEnum.RUN_ERR, "读取差异失败");
         }
     }
 
