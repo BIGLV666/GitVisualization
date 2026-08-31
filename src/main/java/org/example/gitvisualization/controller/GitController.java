@@ -26,11 +26,12 @@ public class GitController {
     private final GitAbstract gitService;
 
     /**
-     * 获取指定仓库的提交图（所有分支的提交节点）。
+     * 获取指定仓库的提交图（最近 limit 条提交，默认 200，最大 1000）。
      */
     @GetMapping("/{warehouseId}/commits")
-    public Result<List<CommitNode>> getCommits(@PathVariable Long warehouseId) {
-        return Result.ok(gitService.getCommits(warehouseId));
+    public Result<List<CommitNode>> getCommits(@PathVariable Long warehouseId,
+                                               @RequestParam(defaultValue = "200") int limit) {
+        return Result.ok(gitService.getCommits(warehouseId, limit));
     }
 
     /**

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import './styles.css'
 
@@ -46,6 +46,11 @@ function App() {
   const [toast, setToast] = useState('')
   const [loading, setLoading] = useState(false)
 
+  // 长耗时 Git 写操作（推送/提交/合并等）的忙碌状态，防止重复点击
+  const [busy, setBusy] = useState(false)
+  const [busyText, setBusyText] = useState('')
+  const busyRef = useRef(false)
+
   // 悬浮提示框（固定定位，避免被裁剪）
   const [tip, setTip] = useState(null)
 
@@ -56,7 +61,8 @@ function App() {
   // 仓库表单弹窗（新增 / 编辑）
   const [showForm, setShowForm] = useState(false)
   const [editing, setEditing] = useState(false)
-  const [form, setForm] = useState({ name: '', warehousePath: '', remoteURL: '' })
+  const [editingId, setEditingId] = useState(null)
+  const [form, setForm] = useState({ name: '', warehousePath: '', remoteURL: '', remoteUsername: '', remoteToken: '' })
 
   // 分支操作弹窗（切换 / 合并 / 新建）
   const [branchModal, setBranchModal] = useState(null)
@@ -193,12 +199,14 @@ function App() {
   // ---- 仓库增删改查 ----
   function openCreate() {
     setEditing(false)
-    setForm({ name: '', warehousePath: '', remoteURL: '' })
+    setEditingId(null)
+    setForm({ name: '', warehousePath: '', remoteURL: '', remoteUsername: '', remoteToken: '' })
     setShowForm(true)
   }
   function openEdit(repo) {
     setEditing(true)
-    setForm({ name: repo.name, warehousePath: repo.warehousePath, remoteURL: repo.remoteURL || '' })
+    setEditingId(repo.warehouseId)
+    setForm({ name: repo.name, warehousePath: repo.warehousePath, remoteURL: repo.remoteURL || '', remoteUsername: repo.remoteUsername || '', remoteToken: repo.remoteToken || '' })
     setShowForm(true)
   }
   async function submitForm(e) {
@@ -206,7 +214,7 @@ function App() {
     if (!form.name || !form.warehousePath) { notify('请填写仓库名称和本地路径'); return }
     try {
       if (editing) {
-        const updated = await request(`/warehouse/${selectedRepo.warehouseId}`, {
+        const updated = await request(`/warehouse/${editingId}`, {
           method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(form)
         })
         notify('仓库已更新')
@@ -238,6 +246,20 @@ function App() {
   }
 
   // ---- Git 操作 ----
+  // 忙碌保护：同一时间只允许一个 Git 写操作，重复点击直接丢弃（不排队）
+  function startBusy(text) {
+    if (busyRef.current) return false
+    busyRef.current = true
+    setBusy(true)
+    setBusyText(text)
+    return true
+  }
+  function endBusy() {
+    busyRef.current = false
+    setBusy(false)
+    setBusyText('')
+  }
+
   const branchModes = {
     create: { title: '新建分支', placeholder: '输入新分支名称', path: 'branch', param: 'name', action: '新建', done: '已新建并切换到分支' },
     switch: { title: '切换分支', placeholder: '输入要切换到的分支名', path: 'switch', param: 'branch', action: '切换', done: '已切换到分支' },
@@ -253,6 +275,7 @@ function App() {
     const { mode } = branchModal
     const cfg = branchModes[mode]
     if (!selectedRepo || !cfg) return
+    if (!startBusy('操作中，请稍候…')) return
     try {
       await request(`/git/${selectedRepo.warehouseId}/${cfg.path}?${cfg.param}=${encodeURIComponent(branchInput.trim())}`, { method: 'POST' })
       notify(`${cfg.done}「${branchInput.trim()}」`)
@@ -260,6 +283,8 @@ function App() {
       refresh(selectedRepo)
     } catch (err) {
       notify(err.message || '操作失败')
+    } finally {
+      endBusy()
     }
   }
 
@@ -292,6 +317,7 @@ function App() {
     e.preventDefault()
     if (!commitMessage.trim()) { notify('请输入提交信息'); return }
     if (!selectedRepo) return
+    if (!startBusy('提交中，请稍候…')) return
     try {
       await request(`/git/${selectedRepo.warehouseId}/commit?message=${encodeURIComponent(commitMessage.trim())}`, { method: 'POST' })
       notify('提交成功')
@@ -300,35 +326,46 @@ function App() {
       refresh(selectedRepo)
     } catch (err) {
       notify(err.message || '提交失败')
+    } finally {
+      endBusy()
     }
   }
   async function doStash() {
     if (!selectedRepo) return
+    if (!startBusy('储藏中，请稍候…')) return
     try {
       await request(`/git/${selectedRepo.warehouseId}/stash`, { method: 'POST' })
       notify('已储藏当前修改')
       refresh(selectedRepo)
     } catch (err) {
       notify(err.message || '储藏失败')
+    } finally {
+      endBusy()
     }
   }
   async function doStashPop() {
     if (!selectedRepo) return
+    if (!startBusy('恢复储藏中，请稍候…')) return
     try {
       await request(`/git/${selectedRepo.warehouseId}/stash/pop`, { method: 'POST' })
       notify('已恢复最近一次储藏')
       refresh(selectedRepo)
     } catch (err) {
       notify(err.message || '恢复储藏失败')
+    } finally {
+      endBusy()
     }
   }
   async function doPush() {
     if (!selectedRepo) return
+    if (!startBusy('推送中，请稍候…')) return
     try {
       await request(`/git/${selectedRepo.warehouseId}/push`, { method: 'POST' })
       notify('推送成功')
     } catch (err) {
       notify(err.message || '推送失败')
+    } finally {
+      endBusy()
     }
   }
   async function openDiff(path) {
@@ -515,6 +552,8 @@ function App() {
         <label>仓库名称<input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="例如：设计系统" /></label>
         <label>本地路径<input value={form.warehousePath} onChange={e => setForm({ ...form, warehousePath: e.target.value })} placeholder="E:\\learncard\\your-repo" /></label>
         <label>远程仓库地址 <small>可选（推送时使用）</small><input value={form.remoteURL} onChange={e => setForm({ ...form, remoteURL: e.target.value })} placeholder="github.com/org/repository" /></label>
+        <label>远程仓库用户名 <small>可选（推送时使用）</small><input value={form.remoteUsername} onChange={e => setForm({ ...form, remoteUsername: e.target.value })} placeholder="GitHub 用户名" /></label>
+        <label>访问令牌 Token <small>推私库必填</small><input type="password" value={form.remoteToken} onChange={e => setForm({ ...form, remoteToken: e.target.value })} placeholder="ghp_xxx（Personal Access Token）" /></label>
         <div className="modal-actions"><button type="button" className="outline-btn" onClick={() => setShowForm(false)}>取消</button><button className="primary-btn">{editing ? '保存修改' : '登记仓库'}</button></div>
       </form>
     </div>}
@@ -570,6 +609,13 @@ function App() {
         <div><span>{tip.c.author}</span><span>{tip.c.id}</span></div>
       </div>
     })()}
+
+    {busy && <div className="modal-backdrop busy-backdrop">
+      <div className="busy-box">
+        <div className="spinner" />
+        <p>{busyText}</p>
+      </div>
+    </div>}
 
     {toast && <div className="toast">{toast}</div>}
   </div>

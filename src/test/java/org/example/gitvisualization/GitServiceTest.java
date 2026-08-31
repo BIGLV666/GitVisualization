@@ -27,7 +27,7 @@ public class GitServiceTest {
         warehouse.setWarehousePath("E:\\learncard\\CodeWise");
         when(warehouseMapper.selectById(1L)).thenReturn(warehouse);
 
-        var list=gitService.getCommits(1L);
+        var list=gitService.getCommits(1L, 200);
         System.out.println(list);
 
     }

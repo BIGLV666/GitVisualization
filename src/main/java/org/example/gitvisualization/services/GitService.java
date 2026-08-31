@@ -7,6 +7,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.eclipse.jgit.api.AddCommand;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.MergeResult;
+import org.eclipse.jgit.api.PushCommand;
 import org.eclipse.jgit.api.ResetCommand;
 import org.eclipse.jgit.api.Status;
 import org.eclipse.jgit.api.errors.*;
@@ -25,6 +26,7 @@ import org.eclipse.jgit.treewalk.CanonicalTreeParser;
 import org.eclipse.jgit.treewalk.EmptyTreeIterator;
 import org.eclipse.jgit.treewalk.FileTreeIterator;
 import org.eclipse.jgit.treewalk.filter.PathFilter;
+import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 import org.example.gitvisualization.entity.Warehouse;
 import org.example.gitvisualization.enums.CodeEnum;
 import org.example.gitvisualization.mapper.WarehouseMapper;
@@ -38,18 +40,27 @@ import org.springframework.util.StringUtils;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.Proxy;
+import java.net.ProxySelector;
+import java.net.SocketAddress;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Git 仓库操作业务服务。
  * <p>
  * 提供提交图遍历、分支（新建/切换/合并）、暂存/提交、储藏、配置、推送等常用 Git 操作。
+ * <p>
+ * 同一仓库的写操作（push/commit/merge/stash 等）通过“仓库名为锁”串行化，避免并发写同一 .git 目录互相踩踏；
+ * 读操作（遍历提交图、status、diff）不加锁，互不影响。
  */
 @Service
 @Slf4j
@@ -59,11 +70,16 @@ public class GitService implements GitAbstract {
     @Autowired
     private WarehouseMapper warehouseMapper;
 
+    /** 每个仓库一个锁对象（按仓库名分组），用于串行化同一仓库的写操作。 */
+    private final Map<String, Object> repoLocks = new ConcurrentHashMap<>();
+
     /**
      * 遍历本地 Git 仓库的所有分支，返回提交图数据（节点列表 + 分支泳道）。
+     * 最多返回 limit 条最近提交，避免大仓库全量遍历导致性能问题。
      */
     @Override
-    public List<CommitNode> getCommits(Long id) {
+    public List<CommitNode> getCommits(Long id, int limit) {
+        int effectiveLimit = Math.max(1, Math.min(limit, 1000));
         try (Repository repo = openRepository(id)) {
             List<CommitNode> nodes = new ArrayList<>();
             Map<String, CommitNode> nodeMap = new HashMap<>();
@@ -87,6 +103,9 @@ public class GitService implements GitAbstract {
                         branchTips.add(tip);
                     }
                     for (RevCommit commit : walk) {
+                        if (nodes.size() >= effectiveLimit) {
+                            break;
+                        }
                         CommitNode node = nodeMap.get(commit.name());
                         if (node == null) {
                             node = new CommitNode();
@@ -109,7 +128,7 @@ public class GitService implements GitAbstract {
                     }
                 }
 
-                assignLanes(nodes, branches, branchTips);
+                assignLanes(nodes, nodeMap, branches, branchTips);
             }
             return nodes;
         } catch (BusinessException e) {
@@ -124,17 +143,20 @@ public class GitService implements GitAbstract {
      */
     @Override
     public void switchCommit(Long id, String targetBranch) {
-        try (Repository repo = openRepository(id)) {
-            try (Git git = new Git(repo)) {
-                git.checkout()
-                        .setName(targetBranch)
-                        .setCreateBranch(false)
-                        .call();
+        Warehouse warehouse = requireWarehouse(id);
+        synchronized (lockFor(warehouse.getName())) {
+            try (Repository repo = openRepository(warehouse)) {
+                try (Git git = new Git(repo)) {
+                    git.checkout()
+                            .setName(targetBranch)
+                            .setCreateBranch(false)
+                            .call();
+                }
+            } catch (CheckoutConflictException e) {
+                throw new BusinessException(CodeEnum.RUN_ERR, "切换失败：存在未提交的修改冲突");
+            } catch (Exception e) {
+                throw new BusinessException(CodeEnum.RUN_ERR, "切换失败");
             }
-        } catch (CheckoutConflictException e) {
-            throw new BusinessException(CodeEnum.RUN_ERR, "切换失败：存在未提交的修改冲突");
-        } catch (Exception e) {
-            throw new BusinessException(CodeEnum.RUN_ERR, "切换失败");
         }
     }
 
@@ -146,17 +168,20 @@ public class GitService implements GitAbstract {
         if (!StringUtils.hasText(branchName)) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "分支名不能为空");
         }
-        try (Repository repo = openRepository(id)) {
-            try (Git git = new Git(repo)) {
-                git.checkout()
-                        .setCreateBranch(true)
-                        .setName(branchName)
-                        .call();
+        Warehouse warehouse = requireWarehouse(id);
+        synchronized (lockFor(warehouse.getName())) {
+            try (Repository repo = openRepository(warehouse)) {
+                try (Git git = new Git(repo)) {
+                    git.checkout()
+                            .setCreateBranch(true)
+                            .setName(branchName)
+                            .call();
+                }
+            } catch (RefAlreadyExistsException e) {
+                throw new BusinessException(ResultCode.CONFLICT, "分支已存在");
+            } catch (Exception e) {
+                throw new BusinessException(CodeEnum.RUN_ERR, "新建分支失败");
             }
-        } catch (RefAlreadyExistsException e) {
-            throw new BusinessException(ResultCode.CONFLICT, "分支已存在");
-        } catch (Exception e) {
-            throw new BusinessException(CodeEnum.RUN_ERR, "新建分支失败");
         }
     }
 
@@ -231,21 +256,24 @@ public class GitService implements GitAbstract {
      */
     @Override
     public void stage(Long id, List<String> paths) {
-        try (Repository repo = openRepository(id)) {
-            try (Git git = new Git(repo)) {
-                if (paths == null || paths.isEmpty()) {
-                    git.add().addFilepattern(".").call();
-                    git.add().setUpdate(true).addFilepattern(".").call();
-                } else {
-                    AddCommand add = git.add();
-                    for (String p : paths) {
-                        add.addFilepattern(p);
+        Warehouse warehouse = requireWarehouse(id);
+        synchronized (lockFor(warehouse.getName())) {
+            try (Repository repo = openRepository(warehouse)) {
+                try (Git git = new Git(repo)) {
+                    if (paths == null || paths.isEmpty()) {
+                        git.add().addFilepattern(".").call();
+                        git.add().setUpdate(true).addFilepattern(".").call();
+                    } else {
+                        AddCommand add = git.add();
+                        for (String p : paths) {
+                            add.addFilepattern(p);
+                        }
+                        add.call();
                     }
-                    add.call();
                 }
+            } catch (Exception e) {
+                throw new BusinessException(CodeEnum.RUN_ERR, "暂存失败");
             }
-        } catch (Exception e) {
-            throw new BusinessException(CodeEnum.RUN_ERR, "暂存失败");
         }
     }
 
@@ -254,20 +282,23 @@ public class GitService implements GitAbstract {
      */
     @Override
     public void unstage(Long id, List<String> paths) {
-        try (Repository repo = openRepository(id)) {
-            try (Git git = new Git(repo)) {
-                ResetCommand reset = git.reset();
-                if (paths == null || paths.isEmpty()) {
-                    reset.call();
-                } else {
-                    for (String p : paths) {
-                        reset.addPath(p);
+        Warehouse warehouse = requireWarehouse(id);
+        synchronized (lockFor(warehouse.getName())) {
+            try (Repository repo = openRepository(warehouse)) {
+                try (Git git = new Git(repo)) {
+                    ResetCommand reset = git.reset();
+                    if (paths == null || paths.isEmpty()) {
+                        reset.call();
+                    } else {
+                        for (String p : paths) {
+                            reset.addPath(p);
+                        }
+                        reset.call();
                     }
-                    reset.call();
                 }
+            } catch (Exception e) {
+                throw new BusinessException(CodeEnum.RUN_ERR, "取消暂存失败");
             }
-        } catch (Exception e) {
-            throw new BusinessException(CodeEnum.RUN_ERR, "取消暂存失败");
         }
     }
 
@@ -279,14 +310,17 @@ public class GitService implements GitAbstract {
         if (!StringUtils.hasText(message)) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "提交信息不能为空");
         }
-        try (Repository repo = openRepository(id)) {
-            try (Git git = new Git(repo)) {
-                git.commit().setMessage(message).call();
+        Warehouse warehouse = requireWarehouse(id);
+        synchronized (lockFor(warehouse.getName())) {
+            try (Repository repo = openRepository(warehouse)) {
+                try (Git git = new Git(repo)) {
+                    git.commit().setMessage(message).call();
+                }
+            } catch (NoHeadException | NoMessageException e) {
+                throw new BusinessException(ResultCode.PARAM_ERROR, e.getMessage());
+            } catch (Exception e) {
+                throw new BusinessException(CodeEnum.RUN_ERR, "提交失败，可能没有已暂存的修改");
             }
-        } catch (NoHeadException | NoMessageException e) {
-            throw new BusinessException(ResultCode.PARAM_ERROR, e.getMessage());
-        } catch (Exception e) {
-            throw new BusinessException(CodeEnum.RUN_ERR, "提交失败，可能没有已暂存的修改");
         }
     }
 
@@ -295,17 +329,20 @@ public class GitService implements GitAbstract {
      */
     @Override
     public void stash(Long id) {
-        try (Repository repo = openRepository(id)) {
-            try (Git git = new Git(repo)) {
-                RevCommit stash = git.stashCreate().call();
-                if (stash == null) {
-                    throw new BusinessException(CodeEnum.RUN_ERR, "没有可储藏的修改");
+        Warehouse warehouse = requireWarehouse(id);
+        synchronized (lockFor(warehouse.getName())) {
+            try (Repository repo = openRepository(warehouse)) {
+                try (Git git = new Git(repo)) {
+                    RevCommit stash = git.stashCreate().call();
+                    if (stash == null) {
+                        throw new BusinessException(CodeEnum.RUN_ERR, "没有可储藏的修改");
+                    }
                 }
+            } catch (BusinessException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new BusinessException(CodeEnum.RUN_ERR, "储藏失败");
             }
-        } catch (BusinessException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new BusinessException(CodeEnum.RUN_ERR, "储藏失败");
         }
     }
 
@@ -314,13 +351,16 @@ public class GitService implements GitAbstract {
      */
     @Override
     public void stashPop(Long id) {
-        try (Repository repo = openRepository(id)) {
-            try (Git git = new Git(repo)) {
-                git.stashApply().call();
-                git.stashDrop().setStashRef(0).call();
+        Warehouse warehouse = requireWarehouse(id);
+        synchronized (lockFor(warehouse.getName())) {
+            try (Repository repo = openRepository(warehouse)) {
+                try (Git git = new Git(repo)) {
+                    git.stashApply().call();
+                    git.stashDrop().setStashRef(0).call();
+                }
+            } catch (Exception e) {
+                throw new BusinessException(CodeEnum.RUN_ERR, "恢复储藏失败，可能存在冲突");
             }
-        } catch (Exception e) {
-            throw new BusinessException(CodeEnum.RUN_ERR, "恢复储藏失败，可能存在冲突");
         }
     }
 
@@ -329,23 +369,26 @@ public class GitService implements GitAbstract {
      */
     @Override
     public void mergeBranch(Long id, String sourceBranch) {
-        try (Repository repo = openRepository(id)) {
-            try (Git git = new Git(repo)) {
-                Ref branchRef = repo.exactRef(Constants.R_HEADS + sourceBranch);
-                if (branchRef == null) {
-                    throw new BusinessException(ResultCode.NOT_FOUND, "分支不存在");
+        Warehouse warehouse = requireWarehouse(id);
+        synchronized (lockFor(warehouse.getName())) {
+            try (Repository repo = openRepository(warehouse)) {
+                try (Git git = new Git(repo)) {
+                    Ref branchRef = repo.exactRef(Constants.R_HEADS + sourceBranch);
+                    if (branchRef == null) {
+                        throw new BusinessException(ResultCode.NOT_FOUND, "分支不存在");
+                    }
+                    MergeResult result = git.merge()
+                            .include(branchRef)
+                            .call();
+                    if (result.getMergeStatus() == MergeResult.MergeStatus.CONFLICTING) {
+                        throw new BusinessException(CodeEnum.RUN_ERR, "合并冲突，请手动解决");
+                    }
                 }
-                MergeResult result = git.merge()
-                        .include(branchRef)
-                        .call();
-                if (result.getMergeStatus() == MergeResult.MergeStatus.CONFLICTING) {
-                    throw new BusinessException(CodeEnum.RUN_ERR, "合并冲突，请手动解决");
-                }
+            } catch (BusinessException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new BusinessException(CodeEnum.RUN_ERR, "合并失败");
             }
-        } catch (BusinessException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new BusinessException(CodeEnum.RUN_ERR, "合并失败");
         }
     }
 
@@ -354,17 +397,20 @@ public class GitService implements GitAbstract {
      */
     @Override
     public void config(Long id, String username, String email) {
-        try (Repository repo = openRepository(id)) {
-            StoredConfig config = repo.getConfig();
-            if (StringUtils.hasText(username)) {
-                config.setString("user", null, "name", username);
+        Warehouse warehouse = requireWarehouse(id);
+        synchronized (lockFor(warehouse.getName())) {
+            try (Repository repo = openRepository(warehouse)) {
+                StoredConfig config = repo.getConfig();
+                if (StringUtils.hasText(username)) {
+                    config.setString("user", null, "name", username);
+                }
+                if (StringUtils.hasText(email)) {
+                    config.setString("user", null, "email", email);
+                }
+                config.save();
+            } catch (Exception e) {
+                throw new BusinessException(CodeEnum.RUN_ERR, "配置失败");
             }
-            if (StringUtils.hasText(email)) {
-                config.setString("user", null, "email", email);
-            }
-            config.save();
-        } catch (Exception e) {
-            throw new BusinessException(CodeEnum.RUN_ERR, "配置失败");
         }
     }
 
@@ -377,13 +423,74 @@ public class GitService implements GitAbstract {
         if (!StringUtils.hasText(warehouse.getRemoteURL())) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "未配置远程仓库地址");
         }
-        try (Repository repo = openRepository(id)) {
-            try (Git git = new Git(repo)) {
-                git.push().setRemote(warehouse.getRemoteURL()).call();
+        synchronized (lockFor(warehouse.getName())) {
+            try (Repository repo = openRepository(warehouse)) {
+                applyProxyFromGitConfig(repo);
+                try (Git git = new Git(repo)) {
+                    PushCommand push = git.push().setRemote(warehouse.getRemoteURL());
+                    if (StringUtils.hasText(warehouse.getRemoteUsername()) && StringUtils.hasText(warehouse.getRemoteToken())) {
+                        push.setCredentialsProvider(new UsernamePasswordCredentialsProvider(
+                                warehouse.getRemoteUsername(), warehouse.getRemoteToken()));
+                    }
+                    push.call();
+                }
+            } catch (BusinessException e) {
+                throw e;
+            } catch (Exception e) {
+                log.error("推送失败, id={}, name={}, remote={}", id, warehouse.getName(), warehouse.getRemoteURL(), e);
+                throw new BusinessException(CodeEnum.RUN_ERR, "推送失败：" + e.getMessage());
             }
-        } catch (Exception e) {
-            throw new BusinessException(CodeEnum.RUN_ERR, "推送失败");
         }
+    }
+
+    /**
+     * 按仓库名获取锁对象（不存在则新建），同一名字的仓库共用一把锁。
+     */
+    private Object lockFor(String name) {
+        return repoLocks.computeIfAbsent(name, k -> new Object());
+    }
+
+    /**
+     * 从仓库的 git 配置读取 http.proxy / https.proxy 并应用到 JGit。
+     * <p>
+     * 命令行 git 会读 git 配置走代理，而 JGit 默认直连不走代理；
+     * 这里解析 git 配置里的代理（如 http://127.0.0.1:7890），设置默认 ProxySelector 使 JGit 也走该代理。
+     * 未配置代理时回退为直连。
+     */
+    private void applyProxyFromGitConfig(Repository repo) {
+        String proxyUrl = repo.getConfig().getString("https", null, "proxy");
+        if (proxyUrl == null || proxyUrl.isBlank()) {
+            proxyUrl = repo.getConfig().getString("http", null, "proxy");
+        }
+        Proxy proxy = Proxy.NO_PROXY;
+        if (proxyUrl != null && !proxyUrl.isBlank()) {
+            try {
+                URI uri = new URI(proxyUrl);
+                String host = uri.getHost();
+                int port = uri.getPort();
+                if (host != null) {
+                    int effectivePort = port > 0
+                            ? port
+                            : ("https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80);
+                    proxy = new Proxy(Proxy.Type.HTTP, new InetSocketAddress(host, effectivePort));
+                }
+            } catch (URISyntaxException e) {
+                log.warn("无法解析 git 代理配置: {}", proxyUrl, e);
+            }
+        }
+        final Proxy finalProxy = proxy;
+        ProxySelector.setDefault(new ProxySelector() {
+            @Override
+            public List<Proxy> select(URI uri) {
+                return Collections.singletonList(finalProxy);
+            }
+
+            @Override
+            public void connectFailed(URI uri, SocketAddress sa, IOException ioe) {
+                // 忽略单次连接失败，交回上层
+            }
+        });
+        log.info("推送代理: {}", finalProxy == Proxy.NO_PROXY ? "直连" : finalProxy);
     }
 
     /**
@@ -398,12 +505,19 @@ public class GitService implements GitAbstract {
     }
 
     /**
-     * 打开本地 Git 仓库。
+     * 打开本地 Git 仓库（按 id）。
      */
     private Repository openRepository(Long id) {
+        return openRepository(requireWarehouse(id));
+    }
+
+    /**
+     * 打开本地 Git 仓库（按已查询到的仓库实体）。
+     */
+    private Repository openRepository(Warehouse warehouse) {
         try {
             return new FileRepositoryBuilder()
-                    .findGitDir(new File(requireWarehouse(id).getWarehousePath()))
+                    .findGitDir(new File(warehouse.getWarehousePath()))
                     .build();
         } catch (IOException e) {
             throw new BusinessException(CodeEnum.RUN_ERR, "打开仓库失败");
@@ -413,7 +527,8 @@ public class GitService implements GitAbstract {
     /**
      * 为每个提交分配泳道（lane）与分支名。
      */
-    private void assignLanes(List<CommitNode> nodes, List<Ref> branches, List<RevCommit> branchTips) {
+    private void assignLanes(List<CommitNode> nodes, Map<String, CommitNode> nodeMap,
+                             List<Ref> branches, List<RevCommit> branchTips) {
         Map<String, Integer> laneOf = new HashMap<>();
         Map<String, String> branchOf = new HashMap<>();
 
@@ -421,12 +536,13 @@ public class GitService implements GitAbstract {
         for (int i = 0; i < branches.size(); i++) {
             String name = Repository.shortenRefName(branches.get(i).getName());
             RevCommit tip = branchTips.get(i);
-            if (tip == null || laneOf.containsKey(tip.name())) {
+            // 分支 tip 不在展示窗口内（或被更优先分支占用）则跳过，不占泳道
+            if (tip == null || !nodeMap.containsKey(tip.name()) || laneOf.containsKey(tip.name())) {
                 continue;
             }
             int lane = nextLane++;
             RevCommit c = tip;
-            while (c != null && !laneOf.containsKey(c.name())) {
+            while (c != null && nodeMap.containsKey(c.name()) && !laneOf.containsKey(c.name())) {
                 laneOf.put(c.name(), lane);
                 branchOf.put(c.name(), name);
                 if (c.getParentCount() == 0) {

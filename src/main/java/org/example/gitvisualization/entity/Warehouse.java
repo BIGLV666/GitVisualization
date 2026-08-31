@@ -19,6 +19,8 @@ public class Warehouse {
     private String warehousePath;
     @TableField("remote_url")
     private String remoteURL;
+    private String remoteUsername;
+    private String remoteToken;
     private WarehouseStatus status;
     private LocalDateTime createTime;
     private LocalDateTime updateTime;
@@ -28,6 +30,8 @@ public class Warehouse {
         this.name=dto.getName();
         this.warehousePath=dto.getWarehousePath();
         this.remoteURL=dto.getRemoteURL();
+        this.remoteUsername=dto.getRemoteUsername();
+        this.remoteToken=dto.getRemoteToken();
         this.updateTime=LocalDateTime.now();
     }
 }

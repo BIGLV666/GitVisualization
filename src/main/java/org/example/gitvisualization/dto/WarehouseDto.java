@@ -8,4 +8,6 @@ public class WarehouseDto {
     private String name;
     private String warehousePath;
     private String remoteURL;
+    private String remoteUsername;
+    private String remoteToken;
 }

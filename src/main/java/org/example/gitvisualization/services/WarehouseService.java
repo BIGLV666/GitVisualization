@@ -67,6 +67,8 @@ public class WarehouseService implements WarehouseAbstract {
         warehouse.setName(dto.getName());
         warehouse.setWarehousePath(dto.getWarehousePath());
         warehouse.setRemoteURL(dto.getRemoteURL());
+        warehouse.setRemoteUsername(dto.getRemoteUsername());
+        warehouse.setRemoteToken(dto.getRemoteToken());
         warehouse.setUpdateTime(LocalDateTime.now());
         try {
             warehouseMapper.updateById(warehouse);

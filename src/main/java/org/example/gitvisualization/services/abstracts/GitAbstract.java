@@ -11,9 +11,12 @@ import java.util.List;
 public interface GitAbstract {
 
     /**
-     * 获取指定仓库的提交图（所有分支的提交节点）。
+     * 获取指定仓库的提交图（最近 limit 条提交，避免大仓库全量遍历）。
+     *
+     * @param id    仓库主键
+     * @param limit 最多返回的提交数
      */
-    List<CommitNode> getCommits(Long id);
+    List<CommitNode> getCommits(Long id, int limit);
 
     /**
      * 切换分支。
