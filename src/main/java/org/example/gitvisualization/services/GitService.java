@@ -202,6 +202,7 @@ public class GitService implements GitAbstract {
                 vo.setModified(new ArrayList<>(s.getModified()));
                 vo.setRemoved(new ArrayList<>(s.getMissing()));
                 vo.setUntracked(new ArrayList<>(s.getUntracked()));
+                vo.setConflicted(new ArrayList<>(s.getConflicting()));
                 vo.setClean(s.isClean());
                 return vo;
             }
@@ -381,7 +382,7 @@ public class GitService implements GitAbstract {
                             .include(branchRef)
                             .call();
                     if (result.getMergeStatus() == MergeResult.MergeStatus.CONFLICTING) {
-                        throw new BusinessException(CodeEnum.RUN_ERR, "合并冲突，请手动解决");
+                        throw new BusinessException(CodeEnum.RUN_ERR, "合并产生冲突，请解决冲突文件后暂存并提交");
                     }
                 }
             } catch (BusinessException e) {

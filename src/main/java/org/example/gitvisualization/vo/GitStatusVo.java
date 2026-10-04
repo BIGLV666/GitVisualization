@@ -18,6 +18,8 @@ public class GitStatusVo {
     private List<String> removed = new ArrayList<>();
     /** 未跟踪（untracked）的新文件 */
     private List<String> untracked = new ArrayList<>();
+    /** 合并冲突（conflicting）的文件列表，仅在合并产生冲突后非空 */
+    private List<String> conflicted = new ArrayList<>();
     /** 工作区是否干净 */
     private boolean clean;
 }

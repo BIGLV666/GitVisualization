@@ -24,7 +24,13 @@ function formatTime(time) {
 }
 
 const PALETTE = ['#55b997', '#9475dc', '#dc9d45', '#55b6c1', '#e07a5f', '#7fb069', '#d16ba5', '#5c8d89']
-const LANE_HEIGHT = 88
+// 纵向拓扑图尺寸常量：行 = 提交（新在上），列 = 泳道（分支）
+const ROW_H = 36
+const COL_W = 26
+const GRAPH_PAD_TOP = 14
+const GRAPH_PAD_LEFT = 24
+// 展示层噪音目录：一键忽略时隐藏这些前缀下的变更文件
+const TOOL_DIR_PREFIXES = ['.mimosa/']
 
 function isMain(b) { return b === 'main' || b === 'master' }
 
@@ -32,7 +38,22 @@ const fileStateMeta = {
   staged: { label: '已暂存', cls: 'staged' },
   modified: { label: '已修改', cls: 'modified' },
   removed: { label: '已删除', cls: 'removed' },
-  untracked: { label: '未跟踪', cls: 'untracked' }
+  untracked: { label: '未跟踪', cls: 'untracked' },
+  conflicted: { label: '冲突', cls: 'conflicted' }
+}
+
+// unified diff 文本按行着色渲染（+绿 / −红 / @@ 定位 / 文件头弱化）
+function DiffLines({ text }) {
+  return <pre className="diff-view">
+    {text.split('\n').map((line, i) => {
+      let cls = ''
+      if (line.startsWith('diff ') || line.startsWith('index ') || line.startsWith('---') || line.startsWith('+++')) cls = 'diff-meta'
+      else if (line.startsWith('@@')) cls = 'diff-hunk'
+      else if (line.startsWith('+')) cls = 'diff-add'
+      else if (line.startsWith('-')) cls = 'diff-del'
+      return <div key={i} className={`diff-line ${cls}`}>{line || ' '}</div>
+    })}
+  </pre>
 }
 
 function App() {
@@ -43,7 +64,7 @@ function App() {
   const [selectedId, setSelectedId] = useState(null)
   const [branch, setBranch] = useState('all')
   const [search, setSearch] = useState('')
-  const [toast, setToast] = useState('')
+  const [toast, setToast] = useState(null)
   const [loading, setLoading] = useState(false)
 
   // 长耗时 Git 写操作（推送/提交/合并等）的忙碌状态，防止重复点击
@@ -57,6 +78,9 @@ function App() {
   // 工作区变更
   const [status, setStatus] = useState(null)
   const [checked, setChecked] = useState(() => new Set())
+  // 变更面板：文件名过滤 + 一键忽略工具目录
+  const [changeFilter, setChangeFilter] = useState('')
+  const [hideToolFiles, setHideToolFiles] = useState(false)
 
   // 仓库表单弹窗（新增 / 编辑）
   const [showForm, setShowForm] = useState(false)
@@ -81,10 +105,23 @@ function App() {
   const [changesOpen, setChangesOpen] = useState(true)
   const [diffView, setDiffView] = useState(null)
 
-  const notify = msg => setToast(msg)
+  // 应用内删除确认弹窗（替代原生 window.confirm）
+  const [confirmBox, setConfirmBox] = useState(null)
+
+  // 合并冲突面板（列出冲突文件）
+  const [conflictBox, setConflictBox] = useState(null)
+
+  // 提交分页：默认 200 条，「加载更多」每次 +200（后端上限 1000）
+  const [limit, setLimit] = useState(200)
+  const [hasMore, setHasMore] = useState(false)
+
+  // 拓扑图滚动容器引用，用于加载后自动定位 HEAD
+  const viewportRef = useRef(null)  // toast 分级：成功（默认绿色）/ 失败（error 红色，停留更久）
+  const notify = (msg, type = 'success') => setToast({ msg, type })
+  const notifyErr = msg => setToast({ msg, type: 'error' })
   useEffect(() => {
     if (!toast) return
-    const t = setTimeout(() => setToast(''), 2600)
+    const t = setTimeout(() => setToast(null), toast.type === 'error' ? 4200 : 2600)
     return () => clearTimeout(t)
   }, [toast])
 
@@ -96,21 +133,24 @@ function App() {
       const keep = arr.some(r => r.warehouseId === selectedRepo?.warehouseId)
       if (!keepSelection || !keep) setSelectedRepo(arr[0] || null)
     } catch (e) {
-      notify(e.message || '加载仓库失败')
+      notifyErr(e.message || '加载仓库失败')
     }
   }
 
-  async function loadCommits(repo) {
+  async function loadCommits(repo, lim = limit) {
     if (!repo) { setCommits([]); setSelectedId(null); return }
     setLoading(true)
     try {
-      const list = await request(`/git/${repo.warehouseId}/commits`)
+      const list = await request(`/git/${repo.warehouseId}/commits?limit=${lim}`)
       const arr = Array.isArray(list) ? list : []
       setCommits(arr)
+      // 返回条数达到上限说明可能还有更早的提交，允许继续加载
+      setHasMore(arr.length >= lim)
       setSelectedId(arr.find(c => c.isHead)?.id || arr[0]?.id || null)
     } catch (e) {
       setCommits([])
-      notify(e.message || '加载提交记录失败')
+      setHasMore(false)
+      notifyErr(e.message || '加载提交记录失败')
     } finally {
       setLoading(false)
     }
@@ -131,8 +171,29 @@ function App() {
     loadStatus(repo)
   }
 
+  // 「加载更多」：增大 limit 重新拉取（列表为最新优先，整体替换保证拓扑一致）
+  function loadMore() {
+    if (!selectedRepo || loading) return
+    const next = limit + 200
+    setLimit(next)
+    loadCommits(selectedRepo, next)
+  }
+
   useEffect(() => { loadRepos() }, [])
   useEffect(() => { if (selectedRepo) refresh(selectedRepo) }, [selectedRepo?.warehouseId])
+
+  // 图加载 / 选中变化后，保证选中行在图视口内可见（仅滚动图容器自身）
+  useEffect(() => {
+    if (!commits.length) return
+    const vp = viewportRef.current
+    if (!vp) return
+    const el = vp.querySelector('.graph-row-wrap.selected')
+    if (!el) return
+    const top = el.offsetTop
+    const bottom = top + el.offsetHeight
+    if (top < vp.scrollTop + 8) vp.scrollTop = top - 8
+    else if (bottom > vp.scrollTop + vp.clientHeight - 8) vp.scrollTop = bottom - vp.clientHeight + 8
+  }, [commits, selectedId])
 
   // 分支列表与颜色
   const branchList = useMemo(() => {
@@ -158,12 +219,14 @@ function App() {
 
   const maxLane = useMemo(() => commits.reduce((m, c) => Math.max(m, c.lane ?? 0), 0), [commits])
 
+  // 纵向布局坐标：行号 = 可见提交顺序（新在上），x 由泳道号决定
   const positions = useMemo(() => {
     const map = {}
     visibleCommits.forEach((c, i) => {
       map[c.id] = {
-        x: 90 + i * 150,
-        y: 110 + (c.lane ?? 0) * LANE_HEIGHT,
+        row: i,
+        x: GRAPH_PAD_LEFT + (c.lane ?? 0) * COL_W,
+        y: GRAPH_PAD_TOP + i * ROW_H + ROW_H / 2,
         color: branchColors[c.branch] || '#8aa5b0'
       }
     })
@@ -172,15 +235,39 @@ function App() {
 
   const byFullId = useMemo(() => Object.fromEntries(commits.map(c => [c.fullId, c])), [commits])
 
-  const graphWidth = Math.max(920, visibleCommits.length * 150 + 120)
-  const graphHeight = Math.max(400, (maxLane + 1) * LANE_HEIGHT + 60)
+  // 画布尺寸：高度随提交行数自适应，宽度 = 泳道区 + 行信息区（各列固定基准宽）
+  const laneAreaWidth = GRAPH_PAD_LEFT + (maxLane + 1) * COL_W
+  const graphWidth = Math.max(720, laneAreaWidth + 820)
+  const graphHeight = GRAPH_PAD_TOP * 2 + Math.max(visibleCommits.length, 8) * ROW_H
   const selected = commits.find(c => c.id === selectedId) || commits[0] || null
   const hasUnnamed = useMemo(() => commits.some(c => !c.branch), [commits])
+  // HEAD 所在分支（用于合并时排除自身、展示当前分支提示）
+  const currentBranch = commits.find(c => c.isHead)?.branch || ''
 
-  // 工作区变更的文件清单
+  // 键盘 ↑/↓ 在提交列表中移动选中（弹窗打开或焦点在输入框时忽略）
+  useEffect(() => {
+    function onKey(e) {
+      if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return
+      const tag = document.activeElement?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return
+      if (showForm || branchModal || commitOpen || configOpen || diffView || confirmBox || conflictBox || busy) return
+      if (!visibleCommits.length) return
+      e.preventDefault()
+      const idx = visibleCommits.findIndex(c => c.id === selectedId)
+      const next = e.key === 'ArrowUp'
+        ? Math.max(0, idx <= 0 ? 0 : idx - 1)
+        : Math.min(visibleCommits.length - 1, idx === -1 ? 0 : idx + 1)
+      setSelectedId(visibleCommits[next].id)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [visibleCommits, selectedId, showForm, branchModal, commitOpen, configOpen, diffView, confirmBox, conflictBox, busy])
+
+  // 工作区变更的文件清单（含合并冲突文件）
   const changeFiles = useMemo(() => {
     if (!status) return []
     return [
+      ...(status.conflicted || []).map(p => ({ path: p, state: 'conflicted' })),
       ...(status.staged || []).map(p => ({ path: p, state: 'staged' })),
       ...(status.modified || []).map(p => ({ path: p, state: 'modified' })),
       ...(status.removed || []).map(p => ({ path: p, state: 'removed' })),
@@ -188,11 +275,37 @@ function App() {
     ]
   }, [status])
 
+  // 展示层过滤：文件名关键字 + 忽略工具目录前缀
+  const visibleChangeFiles = useMemo(() => {
+    let list = changeFiles
+    if (hideToolFiles) list = list.filter(f => !TOOL_DIR_PREFIXES.some(p => f.path.startsWith(p)))
+    const kw = changeFilter.trim().toLowerCase()
+    if (kw) list = list.filter(f => f.path.toLowerCase().includes(kw))
+    return list
+  }, [changeFiles, changeFilter, hideToolFiles])
+
+  // 按状态分组（固定顺序），用于分组渲染与分组勾选
+  const changeGroups = useMemo(() => {
+    const order = [['conflicted', '冲突'], ['staged', '已暂存'], ['modified', '已修改'], ['removed', '已删除'], ['untracked', '未跟踪']]
+    return order
+      .map(([state, label]) => ({ state, label, files: visibleChangeFiles.filter(f => f.state === state) }))
+      .filter(g => g.files.length > 0)
+  }, [visibleChangeFiles])
+
   function toggleCheck(path) {
     setChecked(prev => {
       const next = new Set(prev)
       if (next.has(path)) next.delete(path)
       else next.add(path)
+      return next
+    })
+  }
+
+  // 分组头复选框：整组勾选 / 取消勾选
+  function toggleGroup(files, checkAll) {
+    setChecked(prev => {
+      const next = new Set(prev)
+      files.forEach(f => checkAll ? next.add(f.path) : next.delete(f.path))
       return next
     })
   }
@@ -210,17 +323,18 @@ function App() {
     setForm({ name: repo.name, warehousePath: repo.warehousePath, remoteURL: repo.remoteURL || '', remoteUsername: repo.remoteUsername || '', remoteToken: repo.remoteToken || '' })
     setShowForm(true)
   }
-  function copyToken() {
-    if (!form.remoteToken) { notify('Token 为空'); return }
+  // 通用剪贴板复制（提交哈希、Token 等用户主动复制的场景）
+  function copyText(text, okMsg = '已复制') {
+    if (!text) { notifyErr('内容为空'); return }
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(form.remoteToken).then(() => notify('Token 已复制')).catch(() => notify('复制失败，请手动选择复制'))
+      navigator.clipboard.writeText(text).then(() => notify(okMsg)).catch(() => notifyErr('复制失败，请手动选择复制'))
     } else {
-      notify('当前环境不支持一键复制，请点「显示」后手动复制')
+      notifyErr('当前环境不支持一键复制，请手动选择复制')
     }
   }
   async function submitForm(e) {
     e.preventDefault()
-    if (!form.name || !form.warehousePath) { notify('请填写仓库名称和本地路径'); return }
+    if (!form.name || !form.warehousePath) { notifyErr('请填写仓库名称和本地路径'); return }
     try {
       if (editing) {
         const updated = await request(`/warehouse/${editingId}`, {
@@ -239,19 +353,27 @@ function App() {
       }
       setShowForm(false)
     } catch (err) {
-      notify(err.message || '操作失败')
+      notifyErr(err.message || '操作失败')
     }
   }
-  async function removeRepo(repo) {
-    if (!window.confirm(`确定删除仓库「${repo.name}」吗？此操作不可恢复。`)) return
-    try {
-      await request(`/warehouse/${repo.warehouseId}`, { method: 'DELETE' })
-      notify('仓库已删除')
-      setSelectedRepo(null)
-      await loadRepos(false)
-    } catch (err) {
-      notify(err.message || '删除失败')
-    }
+  // 删除仓库：改为应用内确认弹窗，确认后执行真正删除
+  function removeRepo(repo) {
+    setConfirmBox({
+      title: '删除仓库',
+      text: `确定删除仓库「${repo.name}」吗？仅解除登记，不会删除本地目录，此操作不可恢复。`,
+      onOk: async () => {
+        try {
+          await request(`/warehouse/${repo.warehouseId}`, { method: 'DELETE' })
+          notify('仓库已删除')
+          setSelectedRepo(null)
+          await loadRepos(false)
+        } catch (err) {
+          notifyErr(err.message || '删除失败')
+        } finally {
+          setConfirmBox(null)
+        }
+      }
+    })
   }
 
   // ---- Git 操作 ----
@@ -280,7 +402,7 @@ function App() {
   }
   async function submitBranch(e) {
     e.preventDefault()
-    if (!branchInput.trim()) { notify('请输入分支名称'); return }
+    if (!branchInput.trim()) { notifyErr('请输入分支名称'); return }
     const { mode } = branchModal
     const cfg = branchModes[mode]
     if (!selectedRepo || !cfg) return
@@ -291,7 +413,16 @@ function App() {
       setBranchModal(null)
       refresh(selectedRepo)
     } catch (err) {
-      notify(err.message || '操作失败')
+      notifyErr(err.message || '操作失败')
+      // 合并失败后立即刷新工作区状态；若存在冲突文件则打开冲突面板指引解决
+      if (mode === 'merge') {
+        setBranchModal(null)
+        try {
+          const s = await request(`/git/${selectedRepo.warehouseId}/status`)
+          setStatus(s || null) // 同步回变更面板，冲突文件立刻可见
+          if (s && (s.conflicted || []).length) setConflictBox({ files: s.conflicted })
+        } catch { /* 状态读取失败时忽略，仅保留错误提示 */ }
+      }
     } finally {
       endBusy()
     }
@@ -304,27 +435,27 @@ function App() {
       if (thenRefresh) refresh(selectedRepo)
       else loadStatus(selectedRepo)
     } catch (err) {
-      notify(err.message || failMsg)
+      notifyErr(err.message ||failMsg)
     }
   }
 
   function doStage(paths) {
     if (!selectedRepo) return
-    if (paths && paths.length === 0) { notify('请先勾选要暂存的文件'); return }
+    if (paths && paths.length === 0) { notifyErr('请先勾选要暂存的文件'); return }
     postJson(`/git/${selectedRepo.warehouseId}/stage`, paths, paths.length ? '已暂存选中文件' : '已暂存全部变更', '暂存失败', false)
     setChecked(new Set())
   }
   function doUnstage() {
     if (!selectedRepo) return
     const paths = [...checked]
-    if (paths.length === 0) { notify('请先勾选要取消暂存的文件'); return }
+    if (paths.length === 0) { notifyErr('请先勾选要取消暂存的文件'); return }
     postJson(`/git/${selectedRepo.warehouseId}/unstage`, paths, '已取消暂存', '取消暂存失败', false)
     setChecked(new Set())
   }
 
   async function submitCommit(e) {
     e.preventDefault()
-    if (!commitMessage.trim()) { notify('请输入提交信息'); return }
+    if (!commitMessage.trim()) { notifyErr('请输入提交信息'); return }
     if (!selectedRepo) return
     if (!startBusy('提交中，请稍候…')) return
     try {
@@ -334,7 +465,7 @@ function App() {
       setCommitMessage('')
       refresh(selectedRepo)
     } catch (err) {
-      notify(err.message || '提交失败')
+      notifyErr(err.message ||'提交失败')
     } finally {
       endBusy()
     }
@@ -347,7 +478,7 @@ function App() {
       notify('已储藏当前修改')
       refresh(selectedRepo)
     } catch (err) {
-      notify(err.message || '储藏失败')
+      notifyErr(err.message ||'储藏失败')
     } finally {
       endBusy()
     }
@@ -360,7 +491,7 @@ function App() {
       notify('已恢复最近一次储藏')
       refresh(selectedRepo)
     } catch (err) {
-      notify(err.message || '恢复储藏失败')
+      notifyErr(err.message ||'恢复储藏失败')
     } finally {
       endBusy()
     }
@@ -372,7 +503,7 @@ function App() {
       await request(`/git/${selectedRepo.warehouseId}/push`, { method: 'POST' })
       notify('推送成功')
     } catch (err) {
-      notify(err.message || '推送失败')
+      notifyErr(err.message ||'推送失败')
     } finally {
       endBusy()
     }
@@ -383,13 +514,13 @@ function App() {
       const text = await request(`/git/${selectedRepo.warehouseId}/diff?path=${encodeURIComponent(path)}`)
       setDiffView({ path, text: text || '（该文件没有可显示的差异）' })
     } catch (err) {
-      notify(err.message || '读取差异失败')
+      notifyErr(err.message ||'读取差异失败')
     }
   }
   async function submitConfig(e) {
     e.preventDefault()
     if (!selectedRepo) return
-    if (!configForm.username.trim() && !configForm.email.trim()) { notify('请填写用户名或邮箱'); return }
+    if (!configForm.username.trim() && !configForm.email.trim()) { notifyErr('请填写用户名或邮箱'); return }
     const q = new URLSearchParams()
     if (configForm.username.trim()) q.set('username', configForm.username.trim())
     if (configForm.email.trim()) q.set('email', configForm.email.trim())
@@ -398,7 +529,7 @@ function App() {
       notify('配置已保存')
       setConfigOpen(false)
     } catch (err) {
-      notify(err.message || '配置失败')
+      notifyErr(err.message ||'配置失败')
     }
   }
 
@@ -440,7 +571,7 @@ function App() {
           ))}
         </div>
         <div className="side-footer">
-          <button className="nav-item"><span>{glyph('refresh')}</span><span>刷新数据</span></button>
+          <button className="nav-item" onClick={() => selectedRepo && refresh(selectedRepo)}><span>{glyph('refresh')}</span><span>刷新数据</span></button>
           <div className="profile"><div className="avatar">GV</div><span><b>开发者</b><small>维护者</small></span></div>
         </div>
       </div>
@@ -449,7 +580,7 @@ function App() {
     <main className="main">
       <header className="topbar">
         <div>
-          <div className="breadcrumbs"><span>工作区</span><b>/</b><strong>{selectedRepo?.name || '未选择'}</strong><span className="live-pill"><i /> 实时</span></div>
+          <div className="breadcrumbs"><span>工作区</span><b>/</b><strong>{selectedRepo?.name || '未选择'}</strong>{currentBranch && <span className="branch-pill">{currentBranch}</span>}</div>
           <h1>仓库拓扑图</h1>
         </div>
         <div className="top-actions">
@@ -459,7 +590,9 @@ function App() {
       </header>
 
       <section className="toolbar">
-        <div className="search"><span>{glyph('search')}</span><input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索提交…" /></div>
+        <div className="search"><span>{glyph('search')}</span><input value={search} onChange={e => setSearch(e.target.value)} onKeyDown={e => e.key === 'Escape' && setSearch('')} placeholder="搜索提交…" />
+          {search && <button type="button" className="search-clear" title="清空搜索" onClick={() => setSearch('')}>{glyph('close')}</button>}
+        </div>
         <div className="toolbar-right">
           <span className="commit-count"><i />{visibleCommits.length} 个提交</span>
           <span className="divider" />
@@ -471,15 +604,15 @@ function App() {
 
       <section className="topology-card">
         <div className="card-head">
-          <div><h2>{selectedRepo?.name || '请选择一个仓库'}</h2><p>悬停节点查看提交详情，点击节点固定选中</p></div>
-          <div className="graph-actions"><span className="view-label">横向拓扑图</span></div>
+          <div><h2>{selectedRepo?.name || '请选择一个仓库'}</h2><p>点击行选中提交，↑/↓ 键切换，悬停查看详情</p></div>
+          <div className="graph-actions"><span className="view-label">纵向拓扑图</span></div>
         </div>
         <div className="legend">
           {branchList.map(b => <span key={b}><i style={{ background: branchColors[b] }} />{b}</span>)}
           {hasUnnamed && <span><i style={{ background: '#8aa5b0' }} />已合并的历史分支</span>}
           <span className="head-legend"><i />HEAD</span>
         </div>
-        <div className="graph-viewport">
+        <div className="graph-viewport" ref={viewportRef}>
           {visibleCommits.length === 0
             ? <div className="empty-state">{loading ? '正在加载提交记录…' : '暂无提交记录，请确认仓库路径指向有效的 Git 仓库'}</div>
             : <div className="graph-inner" style={{ width: graphWidth, height: graphHeight }}>
@@ -490,28 +623,47 @@ function App() {
                     return (c.parentIds || []).map(pid => {
                       const parentNode = byFullId[pid]
                       const parent = parentNode ? positions[parentNode.id] : null
-                      if (!parent) return null
-                      const dx = p.x - parent.x
-                      return <path key={`${c.id}-${pid}`} d={`M ${parent.x} ${parent.y} C ${parent.x + dx * 0.45} ${parent.y}, ${p.x - dx * 0.45} ${p.y}, ${p.x} ${p.y}`} fill="none" stroke={p.color} strokeWidth="3" strokeLinecap="round" />
+                      if (!parent) {
+                        // 父提交不在当前筛选/加载范围：向下方（更旧方向）画虚线，明示连线被截断而非消失
+                        return <path key={`${c.id}-${pid}-out`} d={`M ${p.x} ${p.y} V ${graphHeight}`} fill="none" stroke={p.color} strokeWidth="2" strokeDasharray="5 6" strokeLinecap="round" opacity="0.5" />
+                      }
+                      // 纵向 S 曲线：父提交（更旧、在下方）连向子提交
+                      const dy = parent.y - p.y
+                      return <path key={`${c.id}-${pid}`} d={`M ${parent.x} ${parent.y} C ${parent.x} ${parent.y - dy * 0.4}, ${p.x} ${p.y + dy * 0.4}, ${p.x} ${p.y}`} fill="none" stroke={p.color} strokeWidth="2" strokeLinecap="round" />
                     })
                   })}
                 </svg>
                 {visibleCommits.map(c => {
                   const p = positions[c.id]
-                  return <div key={c.id} className={`graph-node-wrap ${selectedId === c.id ? 'selected' : ''}`} style={{ left: p.x - 15, top: p.y - 15, '--node-color': p.color }}
+                  const cls = `graph-row-wrap ${selectedId === c.id ? 'selected' : ''}`
+                  return <div key={c.id} className={cls} style={{ top: GRAPH_PAD_TOP + p.row * ROW_H, height: ROW_H, '--lane-pad': `${laneAreaWidth}px` }}
+                    onClick={() => setSelectedId(c.id)}
                     onMouseEnter={e => setTip({ x: e.clientX, y: e.clientY, c })}
                     onMouseMove={e => setTip({ x: e.clientX, y: e.clientY, c })}
                     onMouseLeave={() => setTip(null)}>
-                    <button className={`graph-node ${c.isHead ? 'head' : ''}`} onClick={() => setSelectedId(c.id)}><span>{c.isHead ? '✦' : ''}</span></button>
+                    <span className={`graph-node-row ${c.isHead ? 'head' : ''}`} style={{ left: p.x, '--node-color': p.color }} />
+                    <span className="row-hash">{c.id}</span>
+                    <span className="row-title">{c.title}</span>
+                    {c.isHead && <span className="row-head-badge">HEAD</span>}
+                    <span className="row-branch"><i style={{ background: p.color }} />{c.branch || '—'}</span>
+                    <span className="row-author">{c.author}</span>
+                    <span className="row-time">{formatTime(c.time)}</span>
                   </div>
                 })}
               </div>}
         </div>
-        <div className="graph-foot"><span><b className="key-dot" />当前 HEAD 已高亮</span><span>横向拖动浏览提交历史</span></div>
+        <div className="graph-foot">
+          <span><b className="key-dot" />当前 HEAD 已高亮，虚线表示父提交在当前筛选范围外</span>
+          {commits.length === 0
+            ? <span>共 0 条提交</span>
+            : hasMore
+              ? <button className="filter-btn" disabled={loading} onClick={loadMore}>{loading ? '加载中…' : `加载更早的提交（已显示 ${commits.length} 条）`}</button>
+              : <span>已加载全部 {commits.length} 条提交</span>}
+        </div>
       </section>
 
       {selected && <section className="detail-card">
-        <div className="detail-head"><h3>提交详情</h3><span className="detail-hash">{selected.fullId}</span></div>
+        <div className="detail-head"><h3>提交详情</h3><button className="detail-hash copy-hash" title="点击复制完整哈希" onClick={() => copyText(selected.fullId, '已复制提交哈希')}>{selected.fullId}</button></div>
         <div className="detail-meta">
           <div className="detail-field"><span>提交标题</span><b>{selected.title}</b></div>
           <div className="detail-field"><span>作者</span><b>{selected.author}</b></div>
@@ -542,16 +694,41 @@ function App() {
         </div>
         {changesOpen && (changeFiles.length === 0
           ? <div className="changes-empty">工作区干净，没有待提交的变更</div>
-          : <div className="file-list">
-              {changeFiles.map(f => (
-                <div key={f.path} className={`file-item ${checked.has(f.path) ? 'checked' : ''}`}>
-                  <input type="checkbox" checked={checked.has(f.path)} onChange={() => toggleCheck(f.path)} />
-                  <span className="file-path" title="点击查看差异" onClick={() => openDiff(f.path)}>{f.path}</span>
-                  <span className={`file-state ${fileStateMeta[f.state].cls}`}>{fileStateMeta[f.state].label}</span>
-                  <button className="file-diff" onClick={() => openDiff(f.path)}>查看</button>
+          : <>
+              <div className="changes-toolbar">
+                <div className="changes-filter">
+                  <span>{glyph('search')}</span>
+                  <input value={changeFilter} onChange={e => setChangeFilter(e.target.value)} onKeyDown={e => e.key === 'Escape' && setChangeFilter('')} placeholder="过滤文件名…" />
+                  {changeFilter && <button type="button" className="filter-clear" title="清空过滤" onClick={() => setChangeFilter('')}>{glyph('close')}</button>}
                 </div>
-              ))}
-            </div>)}
+                <label className="tool-toggle" title="隐藏 .mimosa/ 等工具生成的变更，仅影响显示">
+                  <input type="checkbox" checked={hideToolFiles} onChange={e => setHideToolFiles(e.target.checked)} />
+                  忽略工具目录（.mimosa/）
+                </label>
+                <span className="changes-shown">显示 {visibleChangeFiles.length} / {changeFiles.length} 个文件</span>
+              </div>
+              {visibleChangeFiles.length === 0
+                ? <div className="changes-empty">没有匹配的变更文件，试试调整过滤条件</div>
+                : <div className="file-list">
+                    {changeGroups.map(g => [
+                      <div key={`head-${g.state}`} className={`group-head state-${g.state}`}>
+                        <input type="checkbox" title="勾选/取消整组"
+                          checked={g.files.every(f => checked.has(f.path))}
+                          onChange={e => toggleGroup(g.files, e.target.checked)} />
+                        <span className="group-label">{g.label}</span>
+                        <em>{g.files.length}</em>
+                      </div>,
+                      ...g.files.map(f => (
+                        <div key={f.path} className={`file-item ${checked.has(f.path) ? 'checked' : ''}`}>
+                          <input type="checkbox" checked={checked.has(f.path)} onChange={() => toggleCheck(f.path)} />
+                          <span className="file-path" title="点击查看差异" onClick={() => openDiff(f.path)}>{f.path}</span>
+                          <span className={`file-state ${fileStateMeta[f.state].cls}`}>{fileStateMeta[f.state].label}</span>
+                          <button className="file-diff" onClick={() => openDiff(f.path)}>查看</button>
+                        </div>
+                      ))
+                    ])}
+                  </div>}
+            </>)}
       </section>
     </main>
 
@@ -566,22 +743,35 @@ function App() {
           <div className="token-input">
             <input type={showToken ? 'text' : 'password'} autoComplete="new-password" value={form.remoteToken} onChange={e => setForm({ ...form, remoteToken: e.target.value })} placeholder="ghp_xxx（Personal Access Token）" />
             <button type="button" className="token-toggle" onClick={e => { e.preventDefault(); setShowToken(s => !s) }}>{showToken ? '隐藏' : '显示'}</button>
-            <button type="button" className="token-toggle" onClick={e => { e.preventDefault(); copyToken() }}>复制</button>
+            <button type="button" className="token-toggle" onClick={e => { e.preventDefault(); copyText(form.remoteToken, 'Token 已复制') }}>复制</button>
           </div>
         </label>
         <div className="modal-actions"><button type="button" className="outline-btn" onClick={() => setShowForm(false)}>取消</button><button className="primary-btn">{editing ? '保存修改' : '登记仓库'}</button></div>
       </form>
     </div>}
 
-    {branchModal && <div className="modal-backdrop" onClick={() => setBranchModal(null)}>
-      <form className="modal branch-modal" onSubmit={submitBranch} onClick={e => e.stopPropagation()}>
-        <div className="modal-head"><div><span>分支操作</span><h2>{branchModes[branchModal.mode].title}</h2></div><button type="button" className="icon-btn" onClick={() => setBranchModal(null)}>{glyph('close')}</button></div>
-        <label>分支名称<input autoFocus value={branchInput} onChange={e => setBranchInput(e.target.value)} placeholder={branchModes[branchModal.mode].placeholder} /></label>
-        {branchModal.mode === 'merge' && <div className="hint">源分支将被合并到当前 HEAD 所在分支，冲突时请手动解决。</div>}
-        {branchModal.mode === 'create' && <div className="hint">将从当前 HEAD 创建新分支并切换到它（git checkout -b）。</div>}
-        <div className="modal-actions"><button type="button" className="outline-btn" onClick={() => setBranchModal(null)}>取消</button><button className="primary-btn">{branchModes[branchModal.mode].action}</button></div>
-      </form>
-    </div>}
+    {branchModal && (() => {
+      const cfg = branchModes[branchModal.mode]
+      // 切换/合并时提供已有分支的候选下拉（datalist 原生过滤，仍允许手输）；合并排除当前分支
+      const choices = branchModal.mode === 'create'
+        ? []
+        : branchList.filter(b => branchModal.mode !== 'merge' || b !== currentBranch)
+      return <div className="modal-backdrop" onClick={() => setBranchModal(null)}>
+        <form className="modal branch-modal" onSubmit={submitBranch} onClick={e => e.stopPropagation()}>
+          <div className="modal-head"><div><span>分支操作</span><h2>{cfg.title}</h2></div><button type="button" className="icon-btn" onClick={() => setBranchModal(null)}>{glyph('close')}</button></div>
+          <label>分支名称
+            <input autoFocus value={branchInput} onChange={e => setBranchInput(e.target.value)} placeholder={cfg.placeholder} list={choices.length ? 'branch-options' : undefined} />
+            {choices.length > 0 && <datalist id="branch-options">
+              {choices.map(b => <option key={b} value={b} />)}
+            </datalist>}
+          </label>
+          {branchModal.mode !== 'create' && <div className="hint">当前分支：{currentBranch || '未知（HEAD 处于游离或合并状态）'}</div>}
+          {branchModal.mode === 'merge' && <div className="hint">源分支将被合并到当前分支，冲突时请按冲突面板指引处理。</div>}
+          {branchModal.mode === 'create' && <div className="hint">将从当前 HEAD 创建新分支并切换到它（git checkout -b）。</div>}
+          <div className="modal-actions"><button type="button" className="outline-btn" onClick={() => setBranchModal(null)}>取消</button><button className="primary-btn">{cfg.action}</button></div>
+        </form>
+      </div>
+    })()}
 
     {commitOpen && <div className="modal-backdrop" onClick={() => setCommitOpen(false)}>
       <form className="modal branch-modal" onSubmit={submitCommit} onClick={e => e.stopPropagation()}>
@@ -605,7 +795,31 @@ function App() {
     {diffView && <div className="modal-backdrop" onClick={() => setDiffView(null)}>
       <div className="modal diff-modal" onClick={e => e.stopPropagation()}>
         <div className="modal-head"><div><span>文件差异</span><h2>{diffView.path}</h2></div><button type="button" className="icon-btn" onClick={() => setDiffView(null)}>{glyph('close')}</button></div>
-        <pre className="diff-view">{diffView.text}</pre>
+        <DiffLines text={diffView.text} />
+      </div>
+    </div>}
+
+    {confirmBox && <div className="modal-backdrop" onClick={() => setConfirmBox(null)}>
+      <div className="modal branch-modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-head"><div><span>确认操作</span><h2>{confirmBox.title}</h2></div><button type="button" className="icon-btn" onClick={() => setConfirmBox(null)}>{glyph('close')}</button></div>
+        <div className="confirm-text">{confirmBox.text}</div>
+        <div className="modal-actions"><button type="button" className="outline-btn" onClick={() => setConfirmBox(null)}>取消</button><button className="primary-btn danger-btn" onClick={confirmBox.onOk}>确认删除</button></div>
+      </div>
+    </div>}
+
+    {conflictBox && <div className="modal-backdrop" onClick={() => setConflictBox(null)}>
+      <div className="modal diff-modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-head"><div><span>合并冲突</span><h2>检测到 {conflictBox.files.length} 个冲突文件</h2></div><button type="button" className="icon-btn" onClick={() => setConflictBox(null)}>{glyph('close')}</button></div>
+        <div className="confirm-text">Git 已在下列文件中写入冲突标记。点击「查看冲突」定位差异，手动编辑解决后，在工作区变更面板勾选这些文件暂存并提交，即可完成本次合并。</div>
+        <div className="file-list">
+          {conflictBox.files.map(p => (
+            <div key={p} className="file-item">
+              <span className="file-path">{p}</span>
+              <button className="file-diff" onClick={() => openDiff(p)}>查看冲突</button>
+            </div>
+          ))}
+        </div>
+        <div className="modal-actions"><button className="primary-btn" onClick={() => setConflictBox(null)}>知道了</button></div>
       </div>
     </div>}
 
@@ -632,7 +846,7 @@ function App() {
       </div>
     </div>}
 
-    {toast && <div className="toast">{toast}</div>}
+    {toast && <div className={`toast ${toast.type}`}>{toast.msg}</div>}
   </div>
 }
 
